@@ -1,104 +1,398 @@
-const cleanImg = document.getElementById("treeClean");
-const rustImg  = document.getElementById("treeRust");
+// script.js - קוד סופי משולב: מחשב = Pan / פלאפון = Pinch Zoom יציב + Drag Pan (ממוקד יציבות)
 
-let rustAmount   = 0;    // 0 = נקי, 1 = חלוד לגמרי
-let zoomCenterX  = 0.5;  // איפה העכבר בציר X (0–1)
-let zoomCenterY  = 0.5;  // איפה העכבר בציר Y (0–1)
+// הגדרות עיקריות
+const MAX_ZOOM = 10;
+const RUST_THRESHOLD = [3, 6, 9]; 
+const RUST_HOLD_DELAY_MS = 2000; 
+const GLITCH_DURATION_MS = 500; 
+const MIN_PAN_ZOOM = 1.05; // זום מינימלי לגרירה באצבע אחת
 
-function clamp01(x) {
-  return Math.max(0, Math.min(1, x));
+// אלמנטים
+const imageContainer = document.getElementById('image-container');
+const rustLayers = [
+    document.getElementById('tree-rust1'),
+    document.getElementById('tree-rust2'),
+    document.getElementById('tree-rust-full')
+];
+const cleanLayer = document.getElementById('tree-clean');
+const glitchOverlay = document.getElementById('glitch-overlay');
+
+if (!imageContainer || rustLayers.includes(null) || !glitchOverlay || !cleanLayer) {
+    console.error("שגיאה: חסר אלמנט אחד או יותר ב-HTML. בדוק ששמות ה-ID תואמים.");
 }
 
-function updateView() {
-  // כמה חלודה
-  rustImg.style.opacity = rustAmount;
+// מצב גלובלי
+let currentZoom = 1;
+let isGlitching = false;
+let rustHoldTimeoutId = null;
+let glitchTimeoutId = null;
+let maxRustLevel = 0; 
 
-  // כמה זום — כאן חיזקתי כדי שיהיה "יותר זום אין"
-  const scale = 1 + rustAmount * 0.6;  // אפשר להגדיל עוד אם תרצי
+// --- משתנים לגרירת עכבר וקיזוז מגע ---
+let isDragging = false; // מצב גרירת עכבר/אצבע אחת
+let startX = 0; 
+let startY = 0;
+let currentTranslateX = 0; 
+let currentTranslateY = 0; 
+let previousTranslateX = 0; // המיקום האחרון השמור
+let previousTranslateY = 0;
 
-  // זום לפי מיקום העכבר / האצבע
-  const cx = zoomCenterX - 0.5; // יחסי למרכז (-0.5 עד 0.5)
-  const cy = zoomCenterY - 0.5;
+// --- משתנים לזום דינמי (Pinch) ---
+let initialDistance = 0;
+let isPinching = false;
+let initialFocusPointX = 0; 
+let initialFocusPointY = 0; 
 
-  const move = rustAmount * 140; // כמה להזיז בפיקסלים כשמאוד קרוב
-  const dx = -cx * move;
-  const dy = -cy * move;
 
-  const transform =
-    `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px)) scale(${scale})`;
-
-  cleanImg.style.transform = transform;
-  rustImg.style.transform  = transform;
+function updateImageTransform() {
+    imageContainer.style.transformOrigin = '50% 50%'; 
+    imageContainer.style.transform = 
+        `translate(${currentTranslateX}px, ${currentTranslateY}px) scale(${currentZoom})`;
 }
 
-/* ----- מחשב: גלגלת + מיקום עכבר ----- */
+function updateRustLayers() {
+    if (rustHoldTimeoutId || isGlitching) return;
 
-// גלילה – מוסיפה/מורידה חלודה + זום
-window.addEventListener("wheel", (e) => {
-  e.preventDefault();
+    let currentRustVisible = false;
+    let currentMaxRustIndex = -1;
 
-  if (e.deltaY < 0) {
-    rustAmount += 0.06; // יותר מהיר
-  } else {
-    rustAmount -= 0.06;
-  }
+    rustLayers.forEach((layer, index) => {
+        if (currentZoom >= RUST_THRESHOLD[index]) {
+            currentMaxRustIndex = index;
+        }
+    });
 
-  rustAmount = clamp01(rustAmount);
-  updateView();
-}, { passive: false });
+    maxRustLevel = Math.max(maxRustLevel, currentMaxRustIndex + 1);
 
-// תזוזת עכבר – משנה את נקודת הזום
-window.addEventListener("mousemove", (e) => {
-  zoomCenterX = e.clientX / window.innerWidth;
-  zoomCenterY = e.clientY / window.innerHeight;
-});
+    if (currentZoom === 1) {
+        rustLayers.forEach(layer => layer.style.opacity = 0);
+        cleanLayer.style.opacity = 1;
+    } else {
+        for (let i = 0; i < rustLayers.length; i++) {
+            if (i < maxRustLevel) {
+                rustLayers[i].style.opacity = 1;
+                currentRustVisible = true;
+            } else {
+                rustLayers[i].style.opacity = 0;
+            }
+        }
+        cleanLayer.style.opacity = currentRustVisible ? 0 : 1;
+    }
+}
 
-/* ----- נייד: גרירה למעלה/למטה (אצבע אחת) ----- */
+function activateGlitchAndReset() {
+    if (isGlitching) return;
+    isGlitching = true;
+    glitchOverlay.classList.add('glitching'); 
 
-let lastTouchY = null;
+    glitchTimeoutId = setTimeout(() => {
+        glitchOverlay.classList.remove('glitching');
+        isGlitching = false;
+        glitchTimeoutId = null;
 
-window.addEventListener("touchstart", (e) => {
-  if (e.touches.length === 1) {
-    lastTouchY = e.touches[0].clientY;
-  }
-}, { passive: false });
+        currentZoom = 1;
+        currentTranslateX = 0;
+        currentTranslateY = 0;
+        previousTranslateX = 0;
+        previousTranslateY = 0;
+        maxRustLevel = 0; 
+        updateImageTransform();
+        
+        rustLayers.forEach(layer => layer.style.opacity = 0);
+        cleanLayer.style.opacity = 1;
+        
+    }, GLITCH_DURATION_MS);
+}
 
-window.addEventListener("touchmove", (e) => {
-  if (e.touches.length === 1 && lastTouchY !== null) {
-    e.preventDefault();
-    const currentY = e.touches[0].clientY;
-    const dy = lastTouchY - currentY;   // גרירה למעלה = חיובי
+function performZoom(delta) {
+    if (rustHoldTimeoutId) {
+        clearTimeout(rustHoldTimeoutId);
+        rustHoldTimeoutId = null;
+    }
+    if (glitchTimeoutId) {
+        clearTimeout(glitchTimeoutId);
+        glitchTimeoutId = null;
+        glitchOverlay.classList.remove('glitching');
+        isGlitching = false;
+        currentZoom = 1;
+        currentTranslateX = 0; 
+        currentTranslateY = 0; 
+        previousTranslateX = 0;
+        previousTranslateY = 0;
+        updateImageTransform();
+        rustLayers.forEach(layer => layer.style.opacity = 0);
+        cleanLayer.style.opacity = 1;
+        maxRustLevel = 0; 
+    }
+    if (isGlitching) return;
 
-    const sensitivity = 0.003;          // כמה מהר משתנה החלודה
-    rustAmount += dy * sensitivity;
-    rustAmount = clamp01(rustAmount);
+    let newZoom = currentZoom + delta;
+    newZoom = Math.max(1, Math.min(MAX_ZOOM, newZoom));
+    
+    if (newZoom === 1) {
+        currentTranslateX = 0;
+        currentTranslateY = 0;
+        previousTranslateX = 0;
+        previousTranslateY = 0;
+    }
 
-    // גם במובייל – מרכז זום לפי אצבע
-    zoomCenterX = e.touches[0].clientX / window.innerWidth;
-    zoomCenterY = e.touches[0].clientY / window.innerHeight;
+    currentZoom = newZoom;
+    updateImageTransform();
+    updateRustLayers();
 
-    lastTouchY = currentY;
-    updateView();
-  }
-}, { passive: false });
+    if (currentZoom === 1 && delta < 0) {
+        rustLayers.forEach(layer => layer.style.opacity = 0);
+        rustLayers[2].style.opacity = 1; 
+        cleanLayer.style.opacity = 0;
+        
+        if (!rustHoldTimeoutId) {
+             rustHoldTimeoutId = setTimeout(() => {
+                 rustHoldTimeoutId = null;
+                 activateGlitchAndReset();
+             }, RUST_HOLD_DELAY_MS);
+        }
+    }
+}
 
-window.addEventListener("touchend", () => {
-  lastTouchY = null;
-});
+// ------------------------------------------
+// מאזינים לעכבר (גלגול סטטי וגרירה)
+// ------------------------------------------
 
-updateView();
-window.addEventListener("mousemove", (e) => {
-  const bounds = wrapper.getBoundingClientRect();
-  const mouseX = ((e.clientX - bounds.left) / bounds.width) * 100;
-  const mouseY = ((e.clientY - bounds.top) / bounds.height) * 100;
+function handleWheel(event) {
+    event.preventDefault();
+    const delta = -event.deltaY * 0.005;
+    
+    currentTranslateX = previousTranslateX;
+    currentTranslateY = previousTranslateY;
 
-  wrapper.style.transformOrigin = `${mouseX}% ${mouseY}%`;
-});
-window.addEventListener("touchmove", (e) => {
-  const touch = e.touches[0];
-  const bounds = wrapper.getBoundingClientRect();
-  const x = ((touch.clientX - bounds.left) / bounds.width) * 100;
-  const y = ((touch.clientY - bounds.top) / bounds.height) * 100;
+    performZoom(delta);
+}
 
-  wrapper.style.transformOrigin = `${x}% ${y}%`;
-});
+function handleMouseDown(event) {
+    if (isGlitching || event.button !== 0 || isPinching) return; 
+    
+    isDragging = true;
+    startX = event.clientX;
+    startY = event.clientY;
+    
+    previousTranslateX = currentTranslateX; 
+    previousTranslateY = currentTranslateY;
+    
+    imageContainer.style.cursor = 'grabbing';
+}
+
+function handleMouseMove(event) {
+    if (!isDragging || isGlitching || isPinching) return;
+
+    const dx = event.clientX - startX;
+    const dy = event.clientY - startY;
+
+    if (currentZoom > 1) {
+        currentTranslateX = previousTranslateX + dx;
+        currentTranslateY = previousTranslateY + dy;
+        updateImageTransform();
+    }
+}
+
+function handleMouseUp() {
+    if (!isDragging) return;
+    isDragging = false;
+    previousTranslateX = currentTranslateX; 
+    previousTranslateY = currentTranslateY;
+    imageContainer.style.cursor = 'grab';
+}
+
+// ------------------------------------------
+// מאזינים למגע (Pinch Zoom ו-Drag Pan)
+// ------------------------------------------
+
+function getDistance(t1, t2) {
+    return Math.sqrt(
+        Math.pow(t2.clientX - t1.clientX, 2) +
+        Math.pow(t2.clientY - t1.clientY, 2)
+    );
+}
+
+function getCenter(t1, t2) {
+    return {
+        x: (t1.clientX + t2.clientX) / 2,
+        y: (t1.clientY + t2.clientY) / 2
+    };
+}
+
+function getRelativePosition(clientX, clientY) {
+    const rect = imageContainer.getBoundingClientRect();
+    return {
+        x: clientX - rect.left,
+        y: clientY - rect.top
+    };
+}
+
+
+function handleTouchStart(event) {
+    if (rustHoldTimeoutId || isGlitching) {
+        if (rustHoldTimeoutId) clearTimeout(rustHoldTimeoutId);
+        if (glitchTimeoutId) clearTimeout(glitchTimeoutId);
+        rustHoldTimeoutId = null;
+        glitchTimeoutId = null;
+        glitchOverlay.classList.remove('glitching');
+        isGlitching = false;
+        
+        currentZoom = 1;
+        currentTranslateX = 0;
+        currentTranslateY = 0;
+        previousTranslateX = 0;
+        previousTranslateY = 0;
+        updateImageTransform();
+        rustLayers.forEach(layer => layer.style.opacity = 0);
+        cleanLayer.style.opacity = 1;
+        maxRustLevel = 0; 
+        return;
+    }
+    
+    // ודא שכל מצבי הפעולה הקודמים כבויים
+    isDragging = false;
+    isPinching = false;
+    
+    if (event.touches.length === 2) {
+        isPinching = true;
+        
+        initialDistance = getDistance(event.touches[0], event.touches[1]);
+        const center = getCenter(event.touches[0], event.touches[1]);
+        const relativeCenter = getRelativePosition(center.x, center.y);
+
+        initialFocusPointX = relativeCenter.x;
+        initialFocusPointY = relativeCenter.y;
+
+        previousTranslateX = currentTranslateX;
+        previousTranslateY = currentTranslateY;
+    } else if (event.touches.length === 1 && currentZoom >= MIN_PAN_ZOOM) {
+        isDragging = true;
+        
+        startX = event.touches[0].clientX;
+        startY = event.touches[0].clientY;
+        
+        previousTranslateX = currentTranslateX;
+        previousTranslateY = currentTranslateY;
+    }
+}
+
+function handleTouchMove(event) {
+    if (isGlitching) return;
+    event.preventDefault(); 
+    
+    // אם התחלנו ב-Pinch והאצבעות עדיין שם
+    if (isPinching && event.touches.length === 2) {
+        // --- Pinch Zoom ---
+        
+        const newDistance = getDistance(event.touches[0], event.touches[1]);
+        const scaleFactor = newDistance / initialDistance;
+
+        const oldZoom = currentZoom;
+        const newZoom = Math.max(1, Math.min(MAX_ZOOM, oldZoom * scaleFactor));
+        
+        if (newZoom === oldZoom) return;
+
+        // חישוב קיזוז
+        const containerRect = imageContainer.getBoundingClientRect();
+        const halfWidth = containerRect.width / 2;
+        const halfHeight = containerRect.height / 2;
+        
+        const focusOffsetX = initialFocusPointX - halfWidth;
+        const focusOffsetY = initialFocusPointY - halfHeight;
+
+        const compensateX = focusOffsetX * (newZoom - oldZoom);
+        const compensateY = focusOffsetY * (newZoom - oldZoom);
+
+        currentTranslateX = previousTranslateX - compensateX;
+        currentTranslateY = previousTranslateY - compensateY;
+        
+        currentZoom = newZoom;
+        updateImageTransform();
+        updateRustLayers(); 
+
+        // לוגיקת חלודה/גליץ'
+        if (currentZoom === 1) {
+            rustLayers.forEach(layer => layer.style.opacity = 0);
+            rustLayers[2].style.opacity = 1; 
+            cleanLayer.style.opacity = 0;
+
+            if (!rustHoldTimeoutId) {
+                 rustHoldTimeoutId = setTimeout(() => {
+                     rustHoldTimeoutId = null;
+                     activateGlitchAndReset();
+                 }, RUST_HOLD_DELAY_MS);
+            }
+        } else {
+            if (rustHoldTimeoutId) {
+                clearTimeout(rustHoldTimeoutId);
+                rustHoldTimeoutId = null;
+            }
+        }
+        
+        // ** עדכון המיקום האחרון השמור לאחר קיזוז Pinch **
+        previousTranslateX = currentTranslateX;
+        previousTranslateY = currentTranslateY;
+        initialDistance = newDistance;
+
+    } else if (isDragging && event.touches.length === 1) {
+        // --- Drag Pan ---
+        
+        const dx = event.touches[0].clientX - startX;
+        const dy = event.touches[0].clientY - startY;
+
+        // גרירה רק אם התמונה מוגדלת (הבדיקה נעשתה ב-TouchStart)
+        currentTranslateX = previousTranslateX + dx;
+        currentTranslateY = previousTranslateY + dy;
+        updateImageTransform();
+    }
+}
+
+function handleTouchEnd() {
+    // אם פעולה כלשהי הסתיימה
+    if (isPinching || isDragging) {
+        // ** שמור את המיקום הסופי של הקיזוז/גרירה לאחר כל סיום פעולה **
+        previousTranslateX = currentTranslateX; 
+        previousTranslateY = currentTranslateY;
+    }
+    
+    isPinching = false;
+    isDragging = false; 
+
+    initialFocusPointX = 0; 
+    initialFocusPointY = 0;
+    
+    // מטפל בהמתנת הגליץ' לאחר סיום מגע
+    if (currentZoom === 1 && !rustHoldTimeoutId && !isGlitching) {
+         rustLayers.forEach(layer => layer.style.opacity = 0);
+         rustLayers[2].style.opacity = 1; 
+         cleanLayer.style.opacity = 0;
+         
+         rustHoldTimeoutId = setTimeout(() => {
+             rustHoldTimeoutId = null;
+             activateGlitchAndReset();
+         }, RUST_HOLD_DELAY_MS);
+    }
+}
+
+// ------------------------------------------
+// חיבור מאזיני אירועים
+// ------------------------------------------
+
+window.addEventListener('wheel', handleWheel, { passive: false });
+
+// מאזיני עכבר לגרירה (Pan)
+imageContainer.addEventListener('mousedown', handleMouseDown);
+window.addEventListener('mousemove', handleMouseMove);
+window.addEventListener('mouseup', handleMouseUp); 
+
+// מאזיני מגע
+window.addEventListener('touchstart', handleTouchStart, { passive: false });
+window.addEventListener('touchmove', handleTouchMove, { passive: false });
+window.addEventListener('touchend', handleTouchEnd);
+
+
+// אתחול: התחלה במצב נקי
+updateImageTransform();
+cleanLayer.style.opacity = 1;
+rustLayers.forEach(layer => layer.style.opacity = 0);
